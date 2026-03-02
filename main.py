@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import os
 import bcrypt
 import asyncio
+import httpx
 import simulation_engine as sim
 
 # CONFIG
@@ -18,6 +19,10 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# IA / OpenAI (clave sólo por variable de entorno, nunca en código)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 engine = create_engine(
     DATABASE_URL,
@@ -161,7 +166,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Token validation error: {str(e)}")
 
-# MOTOR DE CLASIFICACIÓN
+# MOTOR DE CLASIFICACIÓN (heurístico base, usado también como fallback si no hay IA)
 
 def classify_ticket(description):
     description = description.lower()
@@ -182,6 +187,127 @@ def calculate_urgency(score):
         return "Media"
     return "Baja"
 
+
+# ─── IA (OpenAI) centralizada en backend ──────────────────────────────────────
+
+def _openai_available() -> bool:
+    return bool(OPENAI_API_KEY)
+
+
+def _openai_chat(messages, max_tokens: int = 60) -> str:
+    """
+    Llamada central a OpenAI Chat Completions.
+    La API key se lee exclusivamente de la variable de entorno OPENAI_API_KEY.
+    """
+    if not _openai_available():
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no está configurada en el backend")
+
+    try:
+        response = httpx.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "max_tokens": max_tokens,
+                "messages": messages,
+            },
+            timeout=20.0,
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Error conectando a OpenAI: {str(e)}")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Error OpenAI: {response.status_code} {response.text}")
+
+    data = response.json()
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+    )
+    if not content:
+        raise HTTPException(status_code=502, detail="Respuesta vacía de OpenAI")
+    return content
+
+
+def classify_ticket_with_ai(title: str, description: str):
+    """
+    Clasifica área y score usando IA si OPENAI_API_KEY está configurada.
+    Si no hay IA disponible, usa el motor heurístico existente.
+    """
+    if not _openai_available():
+        area, score = classify_ticket(description)
+        return area, score
+
+    content = _openai_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Eres un clasificador de solicitudes municipales. "
+                    "Según el título y la descripción, responde SOLO el nombre del área más adecuada "
+                    "entre opciones típicas como: \"Áreas Verdes\", \"Aseo\", \"Infraestructura\", "
+                    "\"Atención General\" u otra similar, sin explicación adicional."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Título: {title}\nDescripción: {description}\nDevuelve solo el nombre del área.",
+            },
+        ],
+        max_tokens=40,
+    )
+
+    area_name = content.splitlines()[0].strip()
+
+    # Score inicial con otro llamado IA (o heurístico si falla)
+    try:
+        score = calculate_priority_with_ai(title, description, area_name)
+    except HTTPException:
+        # Si falla la priorización IA, al menos devolvemos área con score heurístico
+        _, score = classify_ticket(description)
+
+    return area_name, score
+
+
+def calculate_priority_with_ai(title: str, description: str, area: str) -> int:
+    """
+    Calcula score de prioridad 0-100 usando IA si hay API key.
+    Fallback: heurístico basado en classify_ticket().
+    """
+    if not _openai_available():
+        _, score = classify_ticket(description)
+        return score
+
+    content = _openai_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Devuelve solo un número entero entre 0 y 100 que indique la prioridad del ticket "
+                    "(0 = baja, 100 = crítica). No añadas texto adicional."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Área: {area}\nTítulo: {title}\nDescripción: {description}",
+            },
+        ],
+        max_tokens=10,
+    )
+
+    try:
+        value = int(content.strip())
+    except ValueError:
+        raise HTTPException(status_code=502, detail=f"Prioridad no numérica devuelta por OpenAI: {content!r}")
+
+    # Clamp 0-100
+    return max(0, min(100, value))
+
 # SCHEMAS
 
 class UserCreate(BaseModel):
@@ -196,6 +322,11 @@ class TicketCreate(BaseModel):
     # Foto (máx 1) integrada a la solicitud. Puede ser URL o DataURL (base64).
     image_url: str | None = None
     image_description: str | None = ""
+
+
+class AITicketPayload(BaseModel):
+    title: str
+    description: str
 
 # ENDPOINTS
 
@@ -247,7 +378,8 @@ def create_ticket(
     db: Session = Depends(get_db)
 ):
 
-    area_name, score = classify_ticket(ticket.description)
+    # Clasificación de área y score usando IA si está disponible (fallback heurístico)
+    area_name, score = classify_ticket_with_ai(ticket.title, ticket.description)
     area = db.query(Area).filter(Area.name == area_name).first()
 
     if not area:
@@ -417,3 +549,39 @@ def add_evidence(
     db.commit()
 
     return {"message": "Evidence added", "evidence_id": evidence.id}
+
+
+# ─── ENDPOINTS IA para frontend (monitor operador) ────────────────────────────
+
+@app.post("/ai/tickets/classify")
+def ai_classify_ticket(
+    payload: AITicketPayload,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in ["operador", "operator", "supervisor"]:
+        raise HTTPException(status_code=403, detail="Solo operadores pueden acceder a IA de clasificación")
+
+    area, score = classify_ticket_with_ai(payload.title, payload.description)
+    urgency = calculate_urgency(score)
+    return {
+        "area": area,
+        "score": score,
+        "urgency": urgency,
+    }
+
+
+@app.post("/ai/tickets/priority")
+def ai_ticket_priority(
+    payload: AITicketPayload,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in ["operador", "operator", "supervisor"]:
+        raise HTTPException(status_code=403, detail="Solo operadores pueden acceder a IA de prioridad")
+
+    # Para coherencia, usamos IA si hay clave, si no heurístico
+    score = calculate_priority_with_ai(payload.title, payload.description, area="(desconocida)")
+    urgency = calculate_urgency(score)
+    return {
+        "score": score,
+        "urgency": urgency,
+    }
