@@ -13,6 +13,7 @@ import bcrypt
 import asyncio
 import httpx
 import json
+import random
 import simulation_engine as sim
 
 # CONFIG
@@ -345,6 +346,59 @@ def calculate_priority_factors_with_ai(title: str, description: str) -> dict:
     return factors
 
 
+# ─── Vitacura polygon helpers ─────────────────────────────────────────────────
+
+# Polígono de la comuna de Vitacura (lon, lat)
+VITACURA_POLYGON = [
+    (-70.6061611, -33.4102650),
+    (-70.6041870, -33.4034583),
+    (-70.6041870, -33.3957911),
+    (-70.5981789, -33.3894849),
+    (-70.5933723, -33.3851849),
+    (-70.5849609, -33.3812431),
+    (-70.5748329, -33.3794513),
+    (-70.5653229, -33.3770144),
+    (-70.5573406, -33.3758676),
+    (-70.5485001, -33.3742907),
+    (-70.5423203, -33.3756500),
+    (-70.5380249, -33.3807000),
+    (-70.5360000, -33.3900000),
+    (-70.5390000, -33.4050000),
+    (-70.5500000, -33.4150000),
+    (-70.5650000, -33.4200000),
+    (-70.5850000, -33.4200000),
+    (-70.6000000, -33.4160000),
+    (-70.6061611, -33.4102650),
+]
+
+def _point_in_polygon(x: float, y: float, poly: list) -> bool:
+    """Ray-casting algorithm: returns True if point (x,y) is inside polygon."""
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+def _random_point_in_vitacura() -> tuple:
+    """Return a random (lat, lng) strictly inside the Vitacura polygon."""
+    lons = [p[0] for p in VITACURA_POLYGON]
+    lats = [p[1] for p in VITACURA_POLYGON]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    for _ in range(1000):
+        lon = random.uniform(min_lon, max_lon)
+        lat = random.uniform(min_lat, max_lat)
+        if _point_in_polygon(lon, lat, VITACURA_POLYGON):
+            return lat, lon
+    # Fallback: centroid of Vitacura if somehow never lands inside
+    return -33.3947, -70.5680
+
+
 def compute_priority_score_from_factors(factors: dict, weights: dict) -> int:
     total = 0.0
     for key, weight in weights.items():
@@ -478,6 +532,12 @@ def create_ticket(
     urgency = calculate_urgency(priority_score)
     planned_date = datetime.utcnow() + timedelta(hours=area.sla_hours)
 
+    # Usar coordenadas del ciudadano o generar punto aleatorio dentro de Vitacura
+    if ticket.lat is not None and ticket.lng is not None:
+        ticket_lat, ticket_lng = ticket.lat, ticket.lng
+    else:
+        ticket_lat, ticket_lng = _random_point_in_vitacura()
+
     new_ticket = Ticket(
         title=ticket.title,
         description=ticket.description,
@@ -487,8 +547,8 @@ def create_ticket(
         planned_date=planned_date,
         area_id=area.id,
         user_id=current_user.id,
-        lat=ticket.lat,
-        lng=ticket.lng,
+        lat=ticket_lat,
+        lng=ticket_lng,
         metrics_json=json.dumps(factors),
         priority_weights=json.dumps(PRIORITY_WEIGHTS),
     )
@@ -539,23 +599,49 @@ def my_tickets(current_user: User = Depends(get_current_user), db: Session = Dep
     tickets = db.query(Ticket).filter(Ticket.user_id == current_user.id).all()
     return [_serialize_ticket(t, db) for t in tickets]
 
+@app.get("/tickets/count")
+def get_tickets_count(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Endpoint ligero para el monitor de IA.
+    Devuelve solo el total de tickets sin serializar nada.
+    Solo accesible por operadores/supervisores."""
+    if current_user.role not in ["operador", "operator", "supervisor"]:
+        raise HTTPException(status_code=403, detail="Solo operadores pueden acceder")
+    count = db.query(Ticket).count()
+    return {"count": count}
+
 @app.get("/tickets")
 def get_tickets(
     status: Optional[str] = None,
     area: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = 0,
+    order: Optional[str] = "desc",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     if current_user.role not in ["operador", "operator", "supervisor"]:
         raise HTTPException(status_code=403, detail="Solo operadores pueden acceder")
 
-    query = db.query(Ticket).order_by(Ticket.priority_score.desc())
+    query = db.query(Ticket)
+    if order == "asc":
+        query = query.order_by(Ticket.id.asc())
+    else:
+        query = query.order_by(Ticket.priority_score.desc(), Ticket.id.desc())
+
     if status:
         query = query.filter(Ticket.status == status)
     if area:
         area_obj = db.query(Area).filter(Area.name == area).first()
         if area_obj:
             query = query.filter(Ticket.area_id == area_obj.id)
+
+    if offset:
+        query = query.offset(offset)
+    if limit:
+        query = query.limit(limit)
 
     tickets = query.all()
     return [_serialize_ticket(t, db, include_reporter=True) for t in tickets]
