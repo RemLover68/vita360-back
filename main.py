@@ -733,9 +733,24 @@ def assign_squad(
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
+    # Si ya tenía cuadrilla, restar a la anterior (usando un estimado default o el nuevo, 
+    # en una v2 ideal se guardaría el current_estimated_hours en el ticket)
+    if ticket.squad_name and ticket.squad_name != request.squad_name:
+        old_squad = db.query(Squad).filter(Squad.name == ticket.squad_name).first()
+        if old_squad and old_squad.pending_tasks > 0:
+            old_squad.pending_tasks = max(0, old_squad.pending_tasks - request.estimated_hours)
+
     ticket.squad_name = request.squad_name
     if ticket.status == "Recibido":
         ticket.status = "Asignado"
+
+    # Sumar horas estimadas a la nueva cuadrilla
+    new_squad = db.query(Squad).filter(Squad.name == request.squad_name).first()
+    if new_squad:
+        # Usamos pending_tasks como "horas pendientes acumuladas"
+        # Si pending_tasks es None (ej. BD antigua), lo inicializamos
+        current_hours = new_squad.pending_tasks if new_squad.pending_tasks is not None else 0
+        new_squad.pending_tasks = current_hours + request.estimated_hours
 
     db.commit()
     db.refresh(ticket)
@@ -819,24 +834,16 @@ def get_squads(
     db: Session = Depends(get_db),
 ):
     squads = db.query(Squad).all()
-
-    # Si no hay cuadrillas registradas, devolver set por defecto
-    if not squads:
-        default_squads = [
-            {"id": 1, "name": "Cuadrilla Áreas Verdes A", "area_name": "Áreas Verdes", "pending_tasks": 0},
-            {"id": 2, "name": "Cuadrilla Áreas Verdes B", "area_name": "Áreas Verdes", "pending_tasks": 0},
-            {"id": 3, "name": "Cuadrilla Infraestructura", "area_name": "Infraestructura", "pending_tasks": 0},
-            {"id": 4, "name": "Cuadrilla Aseo", "area_name": "Aseo", "pending_tasks": 0},
-            {"id": 5, "name": "Cuadrilla General", "area_name": "Atención General", "pending_tasks": 0},
-        ]
-        return default_squads
+    
+    # Hemos removido la auto-creación para no alterar la BD existente.
 
     return [
         {
             "id": s.id,
             "name": s.name,
             "area_name": s.area_name,
-            "pending_tasks": s.pending_tasks,
+            # Normalizamos nulos a 0 para el frontend
+            "pending_tasks": s.pending_tasks if s.pending_tasks is not None else 0,
         }
         for s in squads
     ]
