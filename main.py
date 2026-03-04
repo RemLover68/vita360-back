@@ -962,3 +962,72 @@ def ai_ticket_priority(
         "metrics": factors,
         "weights": PRIORITY_WEIGHTS,
     }
+
+
+# ─── Nuevo endpoint: descripción de tarea + tiempo estimado ──────────────────
+
+class AITaskPayload(BaseModel):
+    title: str
+    description: str
+    area: str
+    squad_types: List[str]   # nombres de cuadrillas disponibles en el área
+
+
+@app.post("/ai/tickets/task")
+def ai_ticket_task(
+    payload: AITaskPayload,
+    current_user: User = Depends(get_current_user),
+):
+    """Genera una descripción concisa de la tarea y el tiempo estimado de resolución.
+    Recibe el área clasificada y los tipos de cuadrillas disponibles como contexto."""
+
+    if current_user.role not in ["operador", "operator", "supervisor"]:
+        raise HTTPException(status_code=403, detail="Solo operadores pueden acceder")
+
+    squad_list = ", ".join(payload.squad_types) if payload.squad_types else "cuadrilla general"
+
+    if not _openai_available():
+        # Fallback determinista: resumen = primeras 10 palabras del título
+        words = payload.title.split()
+        summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
+        return {"task_summary": summary, "estimated_hours": 24}
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un asistente municipal. Dado un reporte ciudadano y el área de gestión, "
+                "responde SOLO con JSON válido con dos campos:\n"
+                '{"task_summary": "<descripción de la tarea en máximo 15 palabras>", "estimated_hours": <número entero de horas>}\n'
+                "No incluyas texto adicional fuera del JSON."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Área: {payload.area}\n"
+                f"Cuadrillas disponibles: {squad_list}\n"
+                f"Título del reporte: {payload.title}\n"
+                f"Descripción: {payload.description}\n\n"
+                "Devuelve JSON con task_summary (acción concreta para la cuadrilla) y estimated_hours."
+            ),
+        },
+    ]
+
+    try:
+        raw = _openai_chat(messages, max_tokens=100)
+    except HTTPException:
+        words = payload.title.split()
+        summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
+        return {"task_summary": summary, "estimated_hours": 24}
+
+    try:
+        data = json.loads(raw)
+        summary = str(data.get("task_summary", payload.title[:60]))
+        hours = int(data.get("estimated_hours", 24))
+        return {"task_summary": summary, "estimated_hours": max(1, min(hours, 720))}
+    except (json.JSONDecodeError, ValueError):
+        words = payload.title.split()
+        summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
+        return {"task_summary": summary, "estimated_hours": 24}
+
