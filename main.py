@@ -84,15 +84,15 @@ async def fleet_ws(websocket: WebSocket):
 def fleet_state():
     return sim.get_current_state()
 
-# CORS - Orígenes explícitos (allow_credentials=True es incompatible con wildcard "*")
-ALLOWED_ORIGINS = [
-    "https://vita360.vercel.app",
-    "http://localhost:5173",
+origins = [
     "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://vita360.vercel.app",
 ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -444,7 +444,6 @@ class AITicketPayload(BaseModel):
 
 class AssignSquadRequest(BaseModel):
     squad_name: str
-    estimated_hours: int = 2  # horas estimadas para la tarea (default 2h)
 
 class UpdateStatusRequest(BaseModel):
     status: str
